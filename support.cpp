@@ -48,7 +48,7 @@ char *strchrnul(const char *str, int c)
 #endif
 #endif
 
-/* Monotonic milliseconds, used only for the timing log in parse_map. */
+/* Monotonic milliseconds, used for the timing log in parse_map. */
 static double
 now_ms()
 {
