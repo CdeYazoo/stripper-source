@@ -13,6 +13,7 @@
 #include <string.h>
 #if !defined(_WIN32)
 #include <strings.h>
+#include <time.h>
 #endif
 #include "support.h"
 #include "parser.h"
@@ -47,28 +48,54 @@ char *strchrnul(const char *str, int c)
 #endif
 #endif
 
+/* Monotonic milliseconds, used only for the timing log in parse_map. */
+static double
+now_ms()
+{
+#if defined WIN32 || defined _WIN32
+	LARGE_INTEGER freq, count;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&count);
+	return (double)count.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+}
+
 static const char*
 parse_map(const char* map, const char* entities)
 {
-	FILE* fp;
 	char path[256];
 
+	double t_start = now_ms();
 	g_Stripper.SetEntityList(entities);
+	double t_parsed = now_ms();
+	int files_applied = 0;
+	double slowest_ms = 0.0;
+	char slowest_name[128];
+	slowest_name[0] = '\0';
 
 	stripper_game.path_format(path,
 		sizeof(path),
 		"%s/%s/global_filters.cfg",
 		stripper_game.game_path,
 		stripper_game.stripper_cfg_path);
-	fp = fopen(path, "rt");
-	if (fp == NULL)
+	double t_file = now_ms();
+	if (!g_Stripper.ApplyFileFilter(path))
 	{
 		stripper_game.log_message("Could not find global filter file: %s", path);
 	}
 	else
 	{
-		fclose(fp);
-		g_Stripper.ApplyFileFilter(path);
+		double took = now_ms() - t_file;
+		files_applied++;
+		if (took >= slowest_ms)
+		{
+			slowest_ms = took;
+			snprintf(slowest_name, sizeof(slowest_name), "global_filters.cfg");
+		}
 	}
 
 	for (const char* pPart = map; *pPart++ != '\0';)
@@ -76,16 +103,37 @@ parse_map(const char* map, const char* entities)
 		pPart = strchrnul(pPart, '_');
 		stripper_game.path_format(path, sizeof(path), "%s/%s/maps/%.*s.cfg",
 			stripper_game.game_path, stripper_game.stripper_cfg_path, pPart - map, map);
-		fp = fopen(path, "rt");
-
-		if (fp)
+		/* silently skips files that don't exist */
+		t_file = now_ms();
+		if (g_Stripper.ApplyFileFilter(path))
 		{
-			fclose(fp);
-			g_Stripper.ApplyFileFilter(path);
+			double took = now_ms() - t_file;
+			files_applied++;
+			if (took >= slowest_ms)
+			{
+				slowest_ms = took;
+				snprintf(slowest_name, sizeof(slowest_name), "%.*s.cfg", (int)(pPart - map), map);
+			}
 		}
 	}
 
-	return g_Stripper.ToString();
+	double t_filtered = now_ms();
+	const char *result = g_Stripper.ToString();
+	double t_done = now_ms();
+
+	stripper_game.log_message(
+		"Timing for \"%s\": lump %d KB, parse %.1f ms, %d config file(s) %.1f ms (slowest: %s %.1f ms), output %.1f ms, total %.1f ms",
+		map,
+		(int)(strlen(entities) / 1024),
+		t_parsed - t_start,
+		files_applied,
+		t_filtered - t_parsed,
+		slowest_name[0] ? slowest_name : "none",
+		slowest_ms,
+		t_done - t_filtered,
+		t_done - t_start);
+
+	return result;
 }
 
 static const char*
@@ -209,4 +257,3 @@ void operator delete[](void* ptr)
 	free(ptr);
 }
 #endif
-
