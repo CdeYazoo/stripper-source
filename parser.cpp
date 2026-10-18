@@ -10,6 +10,9 @@
  */
 
 #include <stack>
+#include <vector>
+#include <stdlib.h>
+#include <stdio.h>
 #include <ctype.h>
 #include <assert.h>
 #include <string.h>
@@ -21,42 +24,279 @@
 #include "support.h"
 
 
-static bool MatchRegex(pcre2_code *code,
-                       pcre2_match_data *match_data,
-                       const char *subject,
-                       size_t subject_length,
-                       int *ovector)
+/* True if PCRE2 JIT can be used in this process. Checked once. */
+static bool JitAvailable()
 {
-    if (!code || !match_data)
+    static int state = -1;
+    if (state == -1)
+    {
+        state = (pcre2_jit_compile(NULL, PCRE2_JIT_TEST_ALLOC) == 0) ? 1 : 0;
+    }
+    return state == 1;
+}
+
+/* Tokenizes the first  "key" "value"  pair out of a line. Equivalent to the
+ * former regex  "([^"]+)"\s+"([^"]+)"  (unanchored), without the regex engine.
+ */
+static bool ParseKeyValue(const char *s, size_t len,
+                          size_t *key_pos, size_t *key_len,
+                          size_t *val_pos, size_t *val_len)
+{
+    size_t i = 0;
+    while (i < len)
+    {
+        const void *q = memchr(s + i, '"', len - i);
+        if (!q)
+        {
+            return false;
+        }
+        i = (const char *)q - s;
+
+        size_t kb = i + 1;
+        const void *ke = (kb < len) ? memchr(s + kb, '"', len - kb) : NULL;
+        if (!ke)
+        {
+            return false;   /* no closing quote anywhere after this point */
+        }
+        size_t k_end = (const char *)ke - s;
+        if (k_end > kb)
+        {
+            size_t p = k_end + 1;
+            size_t ws = p;
+            while (p < len && isspace((unsigned char)s[p]))
+            {
+                p++;
+            }
+            if (p > ws && p < len && s[p] == '"')
+            {
+                size_t vb = p + 1;
+                const void *ve = (vb < len) ? memchr(s + vb, '"', len - vb) : NULL;
+                if (ve)
+                {
+                    size_t v_end = (const char *)ve - s;
+                    if (v_end > vb)
+                    {
+                        *key_pos = kb;
+                        *key_len = k_end - kb;
+                        *val_pos = vb;
+                        *val_len = v_end - vb;
+                        return true;
+                    }
+                }
+            }
+        }
+        i++;
+    }
+    return false;
+}
+
+static inline char LowerAscii(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+/* needle must already be lowercase */
+static bool ContainsNoCase(const char *h, size_t hl, const char *n, size_t nl)
+{
+    if (nl == 0)
+    {
+        return true;
+    }
+    if (hl < nl)
     {
         return false;
     }
-
-    int rc = pcre2_match(code,
-                         (PCRE2_SPTR)subject,
-                         (PCRE2_SIZE)subject_length,
-                         0,
-                         0,
-                         match_data,
-                         NULL);
-    if (rc < 0)
+    const char first = n[0];
+    for (size_t i = 0; i + nl <= hl; i++)
     {
-        return false;
+        if (LowerAscii(h[i]) != first)
+        {
+            continue;
+        }
+        size_t j = 1;
+        while (j < nl && LowerAscii(h[i + j]) == n[j])
+        {
+            j++;
+        }
+        if (j == nl)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool EqualsNoCase(const char *a, const char *lower_b, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        if (LowerAscii(a[i]) != lower_b[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Recognizes patterns that are just a literal with optional ^ / $ anchors and
+ * leading/trailing ".*", e.g.  prop_physics  ^func_  \.mdl$  ^info_.*
+ * On success fills *needle (lowercased) and *kind. Anything with other regex
+ * syntax returns false and is handed to PCRE2 as before.
+ */
+static bool ClassifySimplePattern(const std::string &pat, std::string *needle, pair_kind *kind)
+{
+    size_t i = 0;
+    size_t end = pat.size();
+    bool left = false, right = false;
+
+    if (i < end && pat[i] == '^')
+    {
+        left = true;
+        i++;
+    }
+    if (end - i >= 2 && pat[i] == '.' && pat[i + 1] == '*')
+    {
+        left = false;
+        i += 2;
+    }
+    if (end > i && pat[end - 1] == '$')
+    {
+        if (end - 1 > i && pat[end - 2] == '\\')
+        {
+            return false;   /* escaped $ - keep it simple, use PCRE2 */
+        }
+        right = true;
+        end--;
+    }
+    if (end - i >= 2 && pat[end - 2] == '.' && pat[end - 1] == '*')
+    {
+        if (end - i >= 3 && pat[end - 3] == '\\')
+        {
+            return false;   /* "\.*" is not ".*" */
+        }
+        right = false;
+        end -= 2;
     }
 
-    PCRE2_SIZE *matches = pcre2_get_ovector_pointer(match_data);
-    uint32_t match_count = pcre2_get_ovector_count(match_data);
-    uint32_t offset_count = match_count * 2;
-    if (offset_count > 30)
+    std::string lit;
+    for (size_t k = i; k < end; k++)
     {
-        offset_count = 30;
+        char c = pat[k];
+        if (c == '\\')
+        {
+            if (k + 1 >= end)
+            {
+                return false;
+            }
+            char n = pat[++k];
+            if (strchr(".*+?()[]{}|^$\\/-", n) == NULL)
+            {
+                return false;   /* \d, \s, \w, ... */
+            }
+            lit.push_back(LowerAscii(n));
+        }
+        else if (strchr(".[](){}*+?|^$", c) != NULL)
+        {
+            return false;
+        }
+        else
+        {
+            lit.push_back(LowerAscii(c));
+        }
     }
 
-    for (uint32_t i = 0; i < offset_count; i++)
-    {
-        ovector[i] = matches[i] == PCRE2_UNSET ? -1 : (int)matches[i];
-    }
+    *needle = lit;
+    if (left && right)
+        *kind = PK_EXACT;
+    else if (left)
+        *kind = PK_PREFIX;
+    else if (right)
+        *kind = PK_SUFFIX;
+    else
+        *kind = PK_CONTAINS;
+    return true;
+}
 
+static inline bool PairValueMatches(parse_pair *p, const std::string &val)
+{
+    switch (p->kind)
+    {
+    case PK_EXACT:
+        return val.size() == p->val.size() && EqualsNoCase(val.data(), p->val.data(), val.size());
+    case PK_PREFIX:
+        return val.size() >= p->val.size() && EqualsNoCase(val.data(), p->val.data(), p->val.size());
+    case PK_SUFFIX:
+        return val.size() >= p->val.size() &&
+               EqualsNoCase(val.data() + (val.size() - p->val.size()), p->val.data(), p->val.size());
+    case PK_CONTAINS:
+        return ContainsNoCase(val.data(), val.size(), p->val.data(), p->val.size());
+    default:
+        break;
+    }
+    if (p->re)
+    {
+        int rc;
+        if (p->jit)
+        {
+            rc = pcre2_jit_match(p->re, (PCRE2_SPTR)val.c_str(), (PCRE2_SIZE)val.size(),
+                                 0, 0, p->match_data, NULL);
+        }
+        else
+        {
+            rc = pcre2_match(p->re, (PCRE2_SPTR)val.c_str(), (PCRE2_SIZE)val.size(),
+                             0, 0, p->match_data, NULL);
+        }
+        return rc >= 0;
+    }
+    return val.size() == p->val.size() && stricmp(val.c_str(), p->val.c_str()) == 0;
+}
+
+static inline bool EntPropsMatch(parse_pair *p, ent_prop *e)
+{
+    return p->kid == e->kid && PairValueMatches(p, e->val);
+}
+
+/* Orders pairs so cheap literal comparisons run before regexes. */
+static void BuildMatchVector(std::list<parse_pair *> &src, std::vector<parse_pair *> &out)
+{
+    out.reserve(src.size());
+    std::list<parse_pair *>::iterator iter;
+    for (iter = src.begin(); iter != src.end(); iter++)
+    {
+        if (!(*iter)->re)
+        {
+            out.push_back(*iter);
+        }
+    }
+    for (iter = src.begin(); iter != src.end(); iter++)
+    {
+        if ((*iter)->re)
+        {
+            out.push_back(*iter);
+        }
+    }
+}
+
+/* An entity matches when every pair in the filter is satisfied by some property. */
+static bool EntityMatchesAll(std::list<ent_prop *> *proplist, const std::vector<parse_pair *> &pairs)
+{
+    for (size_t i = 0; i < pairs.size(); i++)
+    {
+        parse_pair *p = pairs[i];
+        bool found = false;
+        for (std::list<ent_prop *>::iterator it = proplist->begin(); it != proplist->end(); it++)
+        {
+            if (EntPropsMatch(p, *it))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -75,19 +315,13 @@ void f_strncpy_s(char *dest, const char *str, size_t n)
  */
 void UTIL_TrimLeft(char *buffer)
 {
-    // Let's think of this as our iterator
     char *i = buffer;
-
-    // Make sure the buffer isn't null
     if (i && *i)
     {
-        // Add up number of whitespace characters
-        while(isspace(*i))
+        while(isspace((unsigned char)*i))
         {
             i++;
         }
-
-        // If whitespace chars in buffer then adjust string so first non-whitespace char is at start of buffer
         if (i != buffer)
         {
             memmove(buffer, i, (strlen(i) + 1) * sizeof(char));
@@ -95,18 +329,16 @@ void UTIL_TrimLeft(char *buffer)
     }
 }
 
-/* UTIL_TrimLeft
+/* UTIL_TrimRight
  * Removes whitespace characters from right side of string
  */
 void UTIL_TrimRight(char *buffer)
 {
-    // Make sure buffer isn't null
     if (buffer)
     {
-        // Loop through buffer backwards while replacing whitespace chars with null chars
         for (int i = (int)strlen(buffer) - 1; i >= 0; i--)
         {
-            if (isspace(buffer[i]))
+            if (isspace((unsigned char)buffer[i]))
             {
                 buffer[i] = '\0';
             } else {
@@ -119,42 +351,16 @@ void UTIL_TrimRight(char *buffer)
 Stripper::Stripper()
 {
     m_resync = false;
-    jit_compiled = false;
-
-    static constexpr char pattern[] = "\"([^\"]+)\"\\s+\"([^\"]+)\"";
-    int error_code;
-    PCRE2_SIZE error_offset;
-    brk_re = pcre2_compile((PCRE2_SPTR)pattern,
-                           PCRE2_ZERO_TERMINATED,
-                           0,
-                           &error_code,
-                           &error_offset,
-                           NULL);
-    brk_match_data = brk_re ? pcre2_match_data_create_from_pattern(brk_re, NULL) : NULL;
     m_tostring = NULL;
     m_tostring_len = 0;
     m_tostring_maxlen = 0;
+    m_key_table.assign(256, -1);
 }
 
 Stripper::~Stripper()
 {
-    jit_compiled = false;
     Clear();
 
-    if (brk_match_data)
-    {
-        pcre2_match_data_free(brk_match_data);
-    }
-    if (brk_re)
-    {
-        pcre2_code_free(brk_re);
-    }
-
-    while (!m_StringCache.empty())
-    {
-        delete m_StringCache.top();
-        m_StringCache.pop();
-    }
     while (!m_PropCache.empty())
     {
         delete m_PropCache.top();
@@ -164,47 +370,60 @@ Stripper::~Stripper()
     free(m_tostring);
 }
 
-bool Stripper::JITCompile()
+int Stripper::KeyId(const char *key, size_t len)
 {
-    if (!brk_re || jit_compiled)
+    m_key_tmp.resize(len);
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++)
     {
-        return false;
-    }
-    if (pcre2_jit_compile(NULL, PCRE2_JIT_TEST_ALLOC) == 0)
-    {
-        int jit_error = pcre2_jit_compile(brk_re, PCRE2_JIT_COMPLETE);
-        if (jit_error != 0)
+        char c = key[i];
+        if (c >= 'A' && c <= 'Z')
         {
-            char jit_error_msg[256];
-            if (pcre2_get_error_message(jit_error, (PCRE2_UCHAR8 *)jit_error_msg, sizeof(jit_error_msg)) < 0)
-            {
-                snprintf(jit_error_msg, sizeof(jit_error_msg), "Unknown PCRE JIT error");
-            }
-            stripper_game.log_message("Cannot request JIT compilation from PCRE, error: %s", jit_error_msg);
-            return false;
+            c = c - 'A' + 'a';
         }
-        jit_compiled = true;
-        return true;
+        m_key_tmp[i] = c;
+        hash = (hash ^ (unsigned char)c) * 16777619u;
     }
 
-    return false;
-}
-
-std::string *Stripper::AllocString()
-{
-    if (m_StringCache.empty())
+    size_t mask = m_key_table.size() - 1;
+    size_t slot = hash & mask;
+    while (m_key_table[slot] != -1)
     {
-        return new std::string();
-    } else {
-        std::string *str = m_StringCache.top();
-        m_StringCache.pop();
-        return str;
+        const std::string &name = m_key_names[m_key_table[slot]];
+        if (name.size() == len && memcmp(name.data(), m_key_tmp.data(), len) == 0)
+        {
+            return m_key_table[slot];
+        }
+        slot = (slot + 1) & mask;
     }
-}
 
-void Stripper::FreeString(std::string *str)
-{
-    m_StringCache.push(str);
+    int id = (int)m_key_names.size();
+    m_key_names.push_back(m_key_tmp);
+    m_key_table[slot] = id;
+
+    if (m_key_names.size() * 2 > m_key_table.size())
+    {
+        /* grow and rehash */
+        std::vector<int> bigger(m_key_table.size() * 2, -1);
+        size_t new_mask = bigger.size() - 1;
+        for (size_t n = 0; n < m_key_names.size(); n++)
+        {
+            const std::string &name = m_key_names[n];
+            uint32_t h = 2166136261u;
+            for (size_t i = 0; i < name.size(); i++)
+            {
+                h = (h ^ (unsigned char)name[i]) * 16777619u;
+            }
+            size_t s = h & new_mask;
+            while (bigger[s] != -1)
+            {
+                s = (s + 1) & new_mask;
+            }
+            bigger[s] = (int)n;
+        }
+        m_key_table.swap(bigger);
+    }
+    return id;
 }
 
 ent_prop *Stripper::AllocProp()
@@ -232,274 +451,180 @@ void Stripper::FreeProp(ent_prop *prop)
     m_PropCache.push(prop);
 }
 
+void Stripper::ParseEntityLine(const char *s, size_t n, bool &in_block, std::list<ent_prop *> *&cl)
+{
+    if (n > 0 && s[0] == '{' && !in_block)
+    {
+        /* if we reached a '{' and we're not in a block, begin a new block */
+        in_block = true;
+        if (!cl)
+        {
+            cl = new std::list<ent_prop *>();
+        }
+    } else if (n > 0 && s[0] == '}' && in_block) {
+        /* end the old block and push it onto the block list */
+        in_block = false;
+        m_props.push_back(cl);
+        cl = NULL;
+        if (n > 1 && s[1] == '{')
+        {
+            in_block = true;
+            cl = new std::list<ent_prop *>();
+        }
+    } else {
+        size_t kp, kl, vp, vl;
+        if (ParseKeyValue(s, n, &kp, &kl, &vp, &vl) && cl)
+        {
+            ent_prop *e = AllocProp();
+#if defined _DEBUG
+            e->last_alloc = __LINE__;
+#endif
+            e->key.assign(s + kp, kl);
+            e->val.assign(s + vp, vl);
+            e->kid = KeyId(s + kp, kl);
+            cl->push_back(e);
+        }
+    }
+}
+
 void Stripper::SetEntityList(const char *ents)
 {
     Clear();
 
     m_resync = false;
-    AppendToString(ents, strlen(ents));
+    size_t len = strlen(ents);
+    AppendToString(ents, len);
 
-    size_t len = m_tostring_len;
-    char *_tmp = NULL;
-    size_t _tmpsize = 0;
+    /* Single pass: split into lines (newlines inside quotes don't count) and
+     * parse each line in place, with no intermediate copies.
+     */
+    bool in_block = false;
+    std::list<ent_prop *> *cl = NULL;
     size_t pos = 0;
     char in_string = 0;
-    for (size_t i=0; i<len; i++)
+    for (size_t i = 0; i < len; i++)
     {
-        if (ents[i] == '"')
-            in_string ^= 1;
-
-        if ((ents[i] == '\n' || ents[i] == '\r') && !in_string)
+        char c = ents[i];
+        if (c == '"')
         {
-            /* check if we should expand the buffer */
-            if (i-pos+1 >= _tmpsize)
-            {
-                delete [] _tmp;
-                _tmpsize = i-pos+1;
-                _tmp = new char[_tmpsize+1];
-            }
-            /* copy this line */
-            f_strncpy_s(_tmp, &(ents[pos]), i-pos+1);
-            /* make a new string out of it */
-            std::string *pstr = AllocString();
-            pstr->assign(_tmp);
-            /* push it into the lines table */
-            m_lines.push_back(pstr);
-            /* iterate */
-            pos = i+1;
+            in_string ^= 1;
+        }
+        else if ((c == '\n' || c == '\r') && !in_string)
+        {
+            ParseEntityLine(ents + pos, i - pos, in_block, cl);
+            pos = i + 1;
         }
     }
-    /* make sure there is no data we missed */
     if (pos < len)
     {
-        /* expand buffer */
-        if (len-pos+1 >= _tmpsize)
-        {
-            delete [] _tmp;
-            _tmpsize =  len-pos+1;
-            _tmp = new char[_tmpsize+1];
-        }
-        /* copy */
-        f_strncpy_s(_tmp, &(ents[pos]), len-pos+1);
-        /* new string */
-        std::string *pstr = AllocString();
-        pstr->assign(_tmp);
-        /* push it into the lines table */
-        m_lines.push_back(pstr);
+        ParseEntityLine(ents + pos, len - pos, in_block, cl);
     }
-    /* delete temporary string */
-    delete [] _tmp;
 
-    /* build the real props list */
-    _BuildPropList();
+    delete cl;
 }
 
-bool EntPropsMatch(parse_pair *p, ent_prop *e, int *ovector)
+void Stripper::RunBatch(std::vector<pending_op *> &ops)
 {
-    if (stricmp(p->key.c_str(), e->key.c_str()) == 0)
+    if (ops.empty())
     {
-        if (p->re)
+        return;
+    }
+
+    std::list<std::list<ent_prop *> *>::iterator proplist_iter = m_props.begin();
+    while (proplist_iter != m_props.end())
+    {
+        std::list<ent_prop *> *proplist = *proplist_iter;
+        bool removed = false;
+
+        for (size_t n = 0; n < ops.size() && !removed; n++)
         {
-            if (MatchRegex(p->re, p->match_data, e->val.c_str(), e->val.size(), ovector))
+            pending_op *op = ops[n];
+            if (!EntityMatchesAll(proplist, op->match))
             {
-                return true;
+                continue;
             }
-        } else {
-            if (stricmp(e->val.c_str(), p->val.c_str()) == 0)
+
+            if (!op->modify)
             {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-void ListRecycle(std::list<parse_pair *> &toread, std::list<parse_pair *> &towrite)
-{
-    std::list<parse_pair *>::iterator iter;
-    for (iter=toread.begin(); iter!=toread.end(); iter++)
-    {
-        towrite.push_back((*iter));
-    }
-    toread.clear();
-}
-
-void Stripper::RunReplaceFilter(replace_prop &replace, std::list<parse_pair *> &props)
-{
-    std::list<std::list<ent_prop *> *>::iterator ent_iter;
-    std::list<ent_prop *>::iterator prop_iter;
-    std::list<parse_pair *>::iterator parse_iter;
-    std::list<ent_prop *> *proplist;
-    ent_prop *e;
-    parse_pair *p;
-    size_t num_match = 0;
-    int ovector[30];
-
-    for (ent_iter = m_props.begin();
-         ent_iter != m_props.end();
-         ent_iter++)
-    {
-        num_match = 0;
-        proplist = (*ent_iter);
-        /* loop through the list of properties for this block */
-        for (prop_iter = proplist->begin();
-             prop_iter != proplist->end();
-             prop_iter++)
-        {
-            e = (*prop_iter);
-            /* try to match the current property against any we're looking for */
-            for (parse_iter = replace.match.begin();
-                 parse_iter != replace.match.end();
-                 parse_iter++)
-            {
-                p = (*parse_iter);
-                if (EntPropsMatch(p, e, ovector))
+                /* remove this entity */
+                for (std::list<ent_prop *>::iterator it = proplist->begin(); it != proplist->end(); ++it)
                 {
-                    num_match++;
-                    break;
+                    FreeProp(*it);
+#if defined _DEBUG
+                    (*it)->last_free = __LINE__;
+#endif
                 }
-            }
-            /* if we've reached the end of possible matches, we can stop iterating */
-            if (num_match == replace.match.size())
-            {
+                delete proplist;
+                proplist_iter = m_props.erase(proplist_iter);
+                removed = true;
                 break;
             }
-        }
-        /* check if this was a full match */
-        if (num_match == replace.match.size())
-        {
+
+            std::list<ent_prop *>::iterator prop_iter;
+            std::list<parse_pair *>::iterator parse_iter;
+            ent_prop *e;
+            parse_pair *p;
+
             /* first do deletions */
-            prop_iter = proplist->begin();
-            bool matched;
-            while (prop_iter != proplist->end())
+            if (!op->to_remove.empty())
             {
-                e = (*prop_iter);
-                matched = false;
-                for (parse_iter = replace.to_remove.begin();
-                     parse_iter != replace.to_remove.end();
-                     parse_iter++)
+                prop_iter = proplist->begin();
+                while (prop_iter != proplist->end())
                 {
-                    p = (*parse_iter);
-                    if (EntPropsMatch(p, e, ovector))
+                    e = *prop_iter;
+                    bool matched = false;
+                    for (parse_iter = op->to_remove.begin(); parse_iter != op->to_remove.end(); parse_iter++)
                     {
-                        matched = true;
-                        break;
+                        if (EntPropsMatch(*parse_iter, e))
+                        {
+                            matched = true;
+                            break;
+                        }
                     }
-                }
-                if (matched)
-                {
-                    FreeProp(e);
-#if defined _DEBUG
-                    e->last_alloc = __LINE__;
-#endif
-                    prop_iter = proplist->erase(prop_iter);
-                } else {
-                    prop_iter++;
+                    if (matched)
+                    {
+                        FreeProp(e);
+                        prop_iter = proplist->erase(prop_iter);
+                    } else {
+                        prop_iter++;
+                    }
                 }
             }
             /* do replacements */
-            for (prop_iter = proplist->begin();
-                 prop_iter != proplist->end();
-                 prop_iter++)
+            if (!op->to_replace.empty())
             {
-                e = (*prop_iter);
-                for (parse_iter = replace.to_replace.begin();
-                     parse_iter != replace.to_replace.end();
-                     parse_iter++)
+                for (prop_iter = proplist->begin(); prop_iter != proplist->end(); prop_iter++)
                 {
-                    p = (*parse_iter);
-                    /* check if the keys match */
-                    if (stricmp(p->key.c_str(), e->key.c_str()) == 0)
+                    e = *prop_iter;
+                    for (parse_iter = op->to_replace.begin(); parse_iter != op->to_replace.end(); parse_iter++)
                     {
-                        e->val.assign(p->val.c_str());
-                        break;
+                        p = *parse_iter;
+                        if (p->kid == e->kid)
+                        {
+                            e->val = p->val;
+                            break;
+                        }
                     }
                 }
             }
             /* do insertions */
-            for (parse_iter = replace.to_insert.begin();
-                 parse_iter != replace.to_insert.end();
-                 parse_iter++)
+            for (parse_iter = op->to_insert.begin(); parse_iter != op->to_insert.end(); parse_iter++)
             {
-                p = (*parse_iter);
-
+                p = *parse_iter;
                 e = AllocProp();
 #if defined _DEBUG
                 e->last_alloc = __LINE__;
 #endif
-                e->key.assign(p->key.c_str());
-                e->val.assign(p->val.c_str());
-
+                e->key = p->key;
+                e->val = p->val;
+                e->kid = p->kid;
                 proplist->push_back(e);
             }
         }
-    }
 
-    ListRecycle(replace.match, props);
-    ListRecycle(replace.to_insert, props);
-    ListRecycle(replace.to_remove, props);
-    ListRecycle(replace.to_replace, props);
-}
-
-void Stripper::RunRemoveFilter(std::list<parse_pair *> &filters)
-{
-    std::list<std::list<ent_prop *> *>::iterator proplist_iter;
-    std::list<ent_prop *> *proplist;
-    std::list<ent_prop *>::iterator ent_iter;
-    std::list<parse_pair *>::iterator pair_iter, pair_iter_begin, pair_iter_end;
-    parse_pair *p;
-    ent_prop *e;
-
-    int ovector[30];
-    size_t num_match = 0;
-
-    pair_iter_begin = filters.begin();
-    pair_iter_end = filters.end();
-    proplist_iter = m_props.begin();
-    while (proplist_iter != m_props.end())
-    {
-        num_match = 0;
-        proplist = (*proplist_iter);
-        for (ent_iter = proplist->begin();
-             ent_iter != proplist->end();
-             ent_iter++)
+        if (!removed)
         {
-            e = (*ent_iter);
-            for (pair_iter = pair_iter_begin;
-                 pair_iter != pair_iter_end;
-                 pair_iter++)
-            {
-                p = (*pair_iter);
-                if (EntPropsMatch(p, e, ovector))
-                {
-                    num_match++;
-                    break;
-                }
-            }
-            if (num_match == filters.size())
-            {
-                break;
-            }
-        }
-        if (num_match == filters.size())
-        {
-            //remove this one...
-            ent_iter = proplist->begin();
-            while (ent_iter != proplist->end())
-            {
-                e = (*ent_iter);
-                FreeProp(e);
-                ent_iter = proplist->erase(ent_iter);
-#if defined _DEBUG
-                e->last_free = __LINE__;
-#endif
-            }
-            proplist->clear();
-            delete proplist;
-            proplist_iter = m_props.erase(proplist_iter);
-        } else {
-            proplist_iter++;
+            ++proplist_iter;
         }
     }
 }
@@ -517,110 +642,24 @@ void Stripper::RunAddFilter(std::list<parse_pair *> &list)
 #if defined _DEBUG
         e->last_alloc = __LINE__;
 #endif
-        e->key.assign( (*iter)->key.c_str() );
-        e->val.assign( (*iter)->val.c_str() );
+        e->key = (*iter)->key;
+        e->val = (*iter)->val;
+        e->kid = (*iter)->kid;
         cl->push_back(e);
         iter++;
     }
     m_props.push_back(cl);
 }
 
-void Stripper::_BuildPropList()
-{
-    int ovector[30];
-    char *_key = NULL;
-    char *_val = NULL;
-    size_t _keysize = 0;
-    size_t _valsize = 0;
-
-    bool in_block = false;
-    std::list<std::string *>::iterator iter, end=m_lines.end();
-    std::string *s;
-    std::list<ent_prop *> *cl = NULL;
-    for (iter=m_lines.begin(); iter!=end; iter++)
-    {
-        s = (*iter);
-        if (*(s->c_str()) == '{' && !in_block)
-        {
-            /* if we reached a '{' and we're not in a block, begin a new block */
-            in_block = true;
-            if (!cl)
-            {
-                cl = new std::list<ent_prop *>();
-            }
-        } else if (*(s->c_str()) == '}' && in_block) {
-            /* if we reached a '}' ane we're in a block, end the old block
-             * and push it onto the block list
-             */
-            in_block = false;
-            m_props.push_back(cl);
-            cl = NULL;
-            if (*(s->c_str() + 1) == '{')
-            {
-                in_block = true;
-                cl = new std::list<ent_prop *>();
-            }
-        } else {
-            /* try to match our precompiled expression for "..." "..." */
-            if (!stripper_game.should_disable_jit())
-            {
-                JITCompile();
-            }
-            if (MatchRegex(brk_re, brk_match_data, s->c_str(), s->size(), ovector))
-            {
-                size_t l = ovector[3] - ovector[2];
-                if (l > _keysize)
-                {
-                    delete [] _key;
-                    _keysize = l;
-                    _key = new char[l+1];
-                }
-                /* copy the key */
-                f_strncpy_s(_key, s->c_str() + ovector[2], l);
-                l = ovector[5] - ovector[4];
-                if (l > _valsize)
-                {
-                    delete [] _val;
-                    _valsize = l;
-                    _val = new char[l+1];
-                }
-                /* copy the value */
-                f_strncpy_s(_val, s->c_str() + ovector[4], l);
-                if (cl)
-                {
-                    /* add a new ent to the list */
-                    ent_prop *e = AllocProp();
-#if defined _DEBUG
-                    e->last_alloc = __LINE__;
-#endif
-                    e->key.assign(_key);
-                    e->val.assign(_val);
-                    cl->push_back(e);
-                }
-            }
-        }
-    }
-
-    delete [] _val;
-    delete [] _key;
-    delete cl;
-}
-
-void Stripper::ApplyFileFilter(const char *file)
+bool Stripper::ApplyFileFilter(const char *file)
 {
     FILE *fp = fopen(file, "rt");
     if (!fp)
     {
-        return;
+        return false;
     }
 
     char buffer[255];
-    int ovector[30];
-    char *_key = NULL;
-    char *_val = NULL;
-    size_t _keysize = 0;
-    size_t _valsize = 0;
-    size_t len;
 
     enum Mode
     {
@@ -646,11 +685,34 @@ void Stripper::ApplyFileFilter(const char *file)
     int line = 0;
     std::list<parse_pair *>::iterator iter, end;
     replace_prop replace;
-    while (!feof(fp))
+    std::vector<pending_op *> pending;
+    const bool use_jit = !stripper_game.should_disable_jit() && JitAvailable();
+
+    /* Runs queued remove:/modify: blocks in one pass and recycles their pairs. */
+    #define FLUSH_PENDING() \
+        do { \
+            RunBatch(pending); \
+            for (size_t n_ = 0; n_ < pending.size(); n_++) \
+            { \
+                for (iter = pending[n_]->owned.begin(); iter != pending[n_]->owned.end(); iter++) \
+                    fpairs.push(*iter); \
+                delete pending[n_]; \
+            } \
+            pending.clear(); \
+        } while (0)
+
+    /* Moves the pairs in props into dst, recycling anything dst already held. */
+    #define TAKE_PROPS(dst) \
+        do { \
+            for (iter = (dst).begin(); iter != (dst).end(); iter++) \
+                fpairs.push(*iter); \
+            (dst).clear(); \
+            (dst).swap(props); \
+        } while (0)
+
+    while (fgets(buffer, sizeof(buffer)-1, fp))
     {
         line++;
-        buffer[0] = '\0';
-        fgets(buffer, sizeof(buffer)-1, fp);
         //strip whitespace
         UTIL_TrimRight(buffer);
         UTIL_TrimLeft(buffer);
@@ -699,97 +761,89 @@ void Stripper::ApplyFileFilter(const char *file)
                 switch (submode)
                 {
                 case SubMode_None:
-                    {
-                        break;
-                    }
+                    break;
                 case SubMode_Insert:
-                    {
-                        replace.to_insert = props;
-                        props.clear();
-                        break;
-                    }
+                    TAKE_PROPS(replace.to_insert);
+                    break;
                 case SubMode_Remove:
-                    {
-                        replace.to_remove = props;
-                        props.clear();
-                        break;
-                    }
+                    TAKE_PROPS(replace.to_remove);
+                    break;
                 case SubMode_Match:
-                    {
-                        replace.match = props;
-                        props.clear();
-                        break;
-                    }
+                    TAKE_PROPS(replace.match);
+                    break;
                 case SubMode_Replace:
-                    {
-                        replace.to_replace = props;
-                        props.clear();
-                        break;
-                    }
+                    TAKE_PROPS(replace.to_replace);
+                    break;
                 }
             } else {
-                /* run the appropriate routine */
                 if (mode == Mode_Filter)
                 {
-                    RunRemoveFilter(props);
-                } else if (mode == Mode_Add) {
-                    RunAddFilter(props);
+                    /* queue it; it runs with its neighbours in one pass */
+                    pending_op *op = new pending_op;
+                    BuildMatchVector(props, op->match);
+                    op->owned.splice(op->owned.end(), props);
+                    pending.push_back(op);
+                } else {
+                    if (mode == Mode_Add)
+                    {
+                        /* adds append entities that later filters must see,
+                         * so everything queued before it has to run first */
+                        FLUSH_PENDING();
+                        RunAddFilter(props);
+                    }
+                    end = props.end();
+                    for (iter=props.begin(); iter!=end; iter++)
+                    {
+                        fpairs.push((*iter));
+                    }
+                    props.clear();
                 }
-
-                /* push each of the unused filters
-                * and then clear the property list
-                */
-                end = props.end();
-                for (iter=props.begin(); iter!=end; iter++)
-                {
-                    fpairs.push((*iter));
-                }
-                props.clear();
             }
         } else if (strncmp(buffer, "}", 1) == 0 && !in_block && mode == Mode_Replace) {
-            /* run replace filter */
-            RunReplaceFilter(replace, props);
-            end = props.end();
-            for (iter=props.begin(); iter!=end; iter++)
-            {
-                fpairs.push((*iter));
-            }
-            props.clear();
+            /* queue the modify: block */
+            pending_op *op = new pending_op;
+            op->modify = true;
+            BuildMatchVector(replace.match, op->match);
+            op->owned.splice(op->owned.end(), replace.match);
+            op->to_remove.swap(replace.to_remove);
+            op->to_replace.swap(replace.to_replace);
+            op->to_insert.swap(replace.to_insert);
+            op->owned.insert(op->owned.end(), op->to_remove.begin(), op->to_remove.end());
+            op->owned.insert(op->owned.end(), op->to_replace.begin(), op->to_replace.end());
+            op->owned.insert(op->owned.end(), op->to_insert.begin(), op->to_insert.end());
+            pending.push_back(op);
         } else if (in_block) {
-            /* attempt to run our precompiled property match expression */
-            len = strlen(buffer);
-            if (!stripper_game.should_disable_jit())
+            size_t kp, kl, vp, vl;
+            if (ParseKeyValue(buffer, strlen(buffer), &kp, &kl, &vp, &vl))
             {
-                JITCompile();
-            }
-            if (MatchRegex(brk_re, brk_match_data, buffer, len, ovector))
-            {
-                size_t len = ovector[3] - ovector[2];
-                if (len > _keysize)
-                {
-                    delete [] _key;
-                    _keysize = len;
-                    _key = new char[len+1];
-                }
-                /* copy the key */
-                f_strncpy_s(_key, buffer + ovector[2], len);
-                len = ovector[5] - ovector[4];
-                if (len > _valsize)
-                {
-                    delete [] _val;
-                    _valsize = len;
-                    _val = new char[len+1];
-                }
-                /* copy the value */
-                f_strncpy_s(_val, buffer + ovector[4], len);
+                /* Only match-style blocks use patterns. Add/insert/replace
+                 * values are literal, so don't build regexes for them.
+                 */
+                bool wants_regex = (mode == Mode_Filter) ||
+                                   (mode == Mode_Replace &&
+                                    (submode == SubMode_Match || submode == SubMode_Remove));
                 pcre2_code *re = NULL;
                 pcre2_match_data *match_data = NULL;
-                if (_val[0] == '/' && _val[len-1] == '/')
+                bool jit = false;
+                pair_kind kind = PK_LITERAL;
+                std::string val(buffer + vp, vl);
+                if (wants_regex && vl >= 1 && val[0] == '/' && val[vl - 1] == '/')
                 {
-                    _val[--len] = '\0';
+                    val.erase(vl - 1);
+                    std::string needle;
+                    pair_kind simple_kind;
+                    if (ClassifySimplePattern(val.substr(1), &needle, &simple_kind))
+                    {
+                        /* no regex engine needed for this one */
+                        val.swap(needle);
+                        kind = simple_kind;
+                    }
+                    else
+                    {
+                    kind = PK_REGEX;
                     int error_code;
                     PCRE2_SIZE error_offset;
-                    re = pcre2_compile((PCRE2_SPTR)&(_val[1]),
+                    re = pcre2_compile((PCRE2_SPTR)val.c_str() + 1,
                                        PCRE2_ZERO_TERMINATED,
                                        PCRE2_CASELESS,
                                        &error_code,
@@ -806,10 +860,10 @@ void Stripper::ApplyFileFilter(const char *file)
                             strcpy(error, "unknown PCRE2 error");
                         }
                         stripper_game.log_message("File %s parse error (line %d):", file, line);
-                        stripper_game.log_message("Expression(%s): At pos %d, %s", _val, (int)error_offset, error);
+                        stripper_game.log_message("Expression(%s): At pos %d, %s", val.c_str(), (int)error_offset, error);
                         continue;
                     }
-                    if (!stripper_game.should_disable_jit() && pcre2_jit_compile(NULL, PCRE2_JIT_TEST_ALLOC) == 0)
+                    if (use_jit)
                     {
                         int jit_error = pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
                         if (jit_error != 0)
@@ -820,6 +874,8 @@ void Stripper::ApplyFileFilter(const char *file)
                                 snprintf(jit_error_msg, sizeof(jit_error_msg), "Unknown PCRE JIT error");
                             }
                             stripper_game.log_message("Cannot request JIT compilation from PCRE, error: %s", jit_error_msg);
+                        } else {
+                            jit = true;
                         }
                     }
                     match_data = pcre2_match_data_create_from_pattern(re, NULL);
@@ -827,8 +883,9 @@ void Stripper::ApplyFileFilter(const char *file)
                     {
                         pcre2_code_free(re);
                         stripper_game.log_message("File %s parse error (line %d):", file, line);
-                        stripper_game.log_message("Expression(%s): Unable to allocate PCRE2 match data", _val);
+                        stripper_game.log_message("Expression(%s): Unable to allocate PCRE2 match data", val.c_str());
                         continue;
+                    }
                     }
                 }
                 /* get a parse pair from the cache */
@@ -849,21 +906,34 @@ void Stripper::ApplyFileFilter(const char *file)
                     fpairs.pop();
                 }
                 /* assign property information */
-                p->key.assign(_key);
-                p->val.assign(_val);
+                p->key.assign(buffer + kp, kl);
+                p->val.swap(val);
+                p->kid = KeyId(buffer + kp, kl);
+                p->kind = kind;
                 p->re = re;
                 p->match_data = match_data;
+                p->jit = jit;
                 props.push_back(p);
             }
         }
     }
+    #undef TAKE_PROPS
+
+    FLUSH_PENDING();
+    #undef FLUSH_PENDING
 
     /* flush anything remaining */
-    end=props.end();
     for (iter=props.begin(); iter!=props.end(); iter++)
     {
         fpairs.push( (*iter) );
     }
+    /* pairs still held by an unfinished modify: block */
+    #define FLUSH_LIST(l) for (iter=(l).begin(); iter!=(l).end(); iter++) fpairs.push(*iter)
+    FLUSH_LIST(replace.match);
+    FLUSH_LIST(replace.to_insert);
+    FLUSH_LIST(replace.to_remove);
+    FLUSH_LIST(replace.to_replace);
+    #undef FLUSH_LIST
 
     /* delete cached pairs */
     parse_pair *k = NULL;
@@ -885,6 +955,7 @@ void Stripper::ApplyFileFilter(const char *file)
     fclose(fp);
 
     m_resync = true;
+    return true;
 }
 
 const char *Stripper::ToString()
@@ -930,16 +1001,6 @@ const char *Stripper::ToString()
 
 void Stripper::Clear()
 {
-    std::list<std::string *>::iterator lines_iter;
-
-    lines_iter = m_lines.begin();
-    while (lines_iter != m_lines.end())
-    {
-        FreeString((*lines_iter));
-        lines_iter = m_lines.erase(lines_iter);
-    }
-    m_lines.clear();
-
     std::list<ent_prop *>::iterator iter2, end2;
     std::list<std::list<ent_prop *> *>::iterator iter3, end3;
 
